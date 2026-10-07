@@ -38,6 +38,10 @@ class SessionClaim(BaseModel):
     lease_seconds: int = Field(default=60, ge=5, le=3600)
 
 
+class SiteAction(BaseModel):
+    site_code: str = Field(min_length=1, max_length=120)
+
+
 class SessionObservation(BaseModel):
     site_code: str = Field(min_length=1, max_length=120)
     observation: dict[str, Any]

@@ -118,14 +118,23 @@ class CatalogInsights:
     def site_utilization(self, site_code: str) -> dict[str, Any]:
         site = self.connection.execute(
             "SELECT * FROM pilot_sites WHERE code=?",
-            (site_code,),
+            (site_code.strip().lower(),),
         ).fetchone()
         if site is None:
             raise NotFoundError("目的地节点不存在")
-        running = int(self.connection.execute(
-            "SELECT COUNT(*) FROM pilot_sessions WHERE lease_owner=? AND status IN ('running','cancel_requested')",
-            (site_code,),
-        ).fetchone()[0])
+        # 与领取判定保持同一口径：running 与 cancel_requested（等待安全停止）都占用名额，
+        # 只有状态流转（完成/失败/取消确认/超时恢复）后才释放。
+        occupied = self.connection.execute(
+            "SELECT "
+            "SUM(CASE WHEN status='running' THEN 1 ELSE 0 END) AS running,"
+            "SUM(CASE WHEN status='cancel_requested' THEN 1 ELSE 0 END) AS stop_pending "
+            "FROM pilot_sessions WHERE status IN ('running','cancel_requested') "
+            "AND LOWER(COALESCE(lease_owner,''))=?",
+            (site["code"],),
+        ).fetchone()
+        running = int(occupied["running"] or 0)
+        stop_pending = int(occupied["stop_pending"] or 0)
+        active_sessions = running + stop_pending
         completed = int(self.connection.execute(
             "SELECT COUNT(*) FROM pilot_observations WHERE created_by=?",
             (site_code,),
@@ -135,18 +144,20 @@ class CatalogInsights:
             (site_code,),
         ).fetchone()[0])
         capacity = int(site["max_concurrent"])
-        available = max(0, capacity - running) if site["status"] == "active" else 0
+        available = max(0, capacity - active_sessions) if site["status"] == "active" else 0
         return {
             "site_code": site["code"],
             "site_name": site["name"],
             "status": site["status"],
             "capabilities": json.loads(site["capabilities_json"]),
             "max_concurrent": capacity,
-            "active_sessions": running,
+            "active_sessions": active_sessions,
+            "running_sessions": running,
+            "stop_pending_sessions": stop_pending,
             "available_slots": available,
             "completed_observations": completed,
             "failed_sessions": failed,
-            "over_capacity": running > capacity,
+            "over_capacity": active_sessions > capacity,
         }
 
     def portfolio_summary(self) -> dict[str, Any]:

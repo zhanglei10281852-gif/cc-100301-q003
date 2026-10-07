@@ -2,7 +2,7 @@
 
 from fastapi import APIRouter, Query
 
-from app.pilots.schemas import BatchOperation, CancelRequest, PriorityRequest, QuotaSet, RetryRequest, SessionClaim, SessionFailure, SessionObservation, SessionSubmit, ProtocolCreate
+from app.pilots.schemas import BatchOperation, CancelRequest, PriorityRequest, QuotaSet, RetryRequest, SessionClaim, SessionFailure, SessionObservation, SessionSubmit, ProtocolCreate, SiteAction
 from app.pilots.service import PilotOperationsService
 
 router = APIRouter(prefix="/api/pilots", tags=["深度旅行运营游览场次运营"])
@@ -44,7 +44,7 @@ def get_session(session_id: int):
 
 @router.post("/sessions/claim")
 def claim_session(payload: SessionClaim):
-    return {"session": service().claim(payload.site_code, payload.capabilities, payload.lease_seconds)}
+    return service().claim(payload.site_code, payload.capabilities, payload.lease_seconds)
 
 
 @router.post("/sessions/{session_id}/heartbeat")
@@ -65,6 +65,11 @@ def fail_session(session_id: int, payload: SessionFailure):
 @router.post("/sessions/{session_id}/cancel")
 def cancel_session(session_id: int, payload: CancelRequest):
     return service().cancel(session_id, payload.actor, payload.reason)
+
+
+@router.post("/sessions/{session_id}/acknowledge-stop")
+def acknowledge_stop(session_id: int, payload: SiteAction):
+    return service().acknowledge_stop(session_id, payload.site_code)
 
 
 @router.post("/sessions/{session_id}/retry")

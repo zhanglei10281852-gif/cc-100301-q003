@@ -50,12 +50,36 @@ def test_protocol_submission_idempotency_and_parameter_validation(client):
     assert rejected.status_code == 422
 
 
+def create_site(client, code: str, *, capabilities: list[str], max_concurrent: int = 1, status: str = "active") -> None:
+    payload = {
+        "code": code,
+        "name": f"节点 {code}",
+        "site_type": "交通枢纽",
+        "region": "测试县域",
+        "capabilities": capabilities,
+        "max_concurrent": max_concurrent,
+    }
+    if status != "active":
+        response = client.post("/api/catalog/sites", json=payload)
+        assert response.status_code == 201, response.text
+        patched = client.patch(f"/api/catalog/sites/{code}", json={"status": status})
+        assert patched.status_code == 200, patched.text
+        return
+    response = client.post("/api/catalog/sites", json=payload)
+    assert response.status_code == 201, response.text
+
+
 def test_priority_capability_claim_and_observation_version(client):
     create_protocol(client)
+    create_site(client, "w0", capabilities=["other-route"])
+    create_site(client, "w1", capabilities=["chapter-transfer"])
     low = client.post("/api/pilots/sessions", json=submit_payload("priority-low", priority=10)).json()
     high = client.post("/api/pilots/sessions", json=submit_payload("priority-high", priority=90)).json()
     no_match = client.post("/api/pilots/sessions/claim", json={"site_code": "w0", "capabilities": ["other"], "lease_seconds": 60})
-    assert no_match.status_code == 200 and no_match.json()["session"] is None
+    assert no_match.status_code == 200
+    body = no_match.json()
+    assert body["accepted"] is False and body["session"] is None
+    assert body["reason"] == "capability_mismatch"
     claimed = client.post("/api/pilots/sessions/claim", json={"site_code": "w1", "capabilities": ["chapter-transfer"], "lease_seconds": 60})
     assert claimed.status_code == 200
     assert claimed.json()["session"]["id"] == high["id"]
@@ -103,15 +127,25 @@ def test_failure_backoff_and_expired_lease_recovery(client):
     clock = FrozenClock(datetime(2026, 9, 26, 2, 0, tzinfo=UTC))
     service = PilotOperationsService(get_connection(), clock)
     service.create_protocol(PROTOCOL, "administrator")
+    from app.catalog.service import CatalogService
+
+    CatalogService(get_connection(), clock).create_site({
+        "code": "site-a",
+        "name": "米轨接驳点",
+        "site_type": "交通枢纽",
+        "region": "测试县域",
+        "capabilities": ["chapter-transfer"],
+        "max_concurrent": 1,
+    })
     first = service.submit(submit_payload("failure-000001"))
     claimed = service.claim("site-a", ["chapter-transfer"], 10)
-    assert claimed and claimed["id"] == first["id"]
+    assert claimed["accepted"] and claimed["session"]["id"] == first["id"]
     failed = service.fail(first["id"], "site-a", "connection_delayed", "前序列车晚点导致接驳窗口不稳定", True)
     assert failed["status"] == "queued"
     assert failed["available_at"] > failed["updated_at"]
     clock.advance(seconds=2)
     claimed_again = service.claim("site-a", ["chapter-transfer"], 10)
-    assert claimed_again and claimed_again["attempt_count"] == 2
+    assert claimed_again["accepted"] and claimed_again["session"]["attempt_count"] == 2
     clock.advance(seconds=11)
     recovered = service.recover_expired()
     assert recovered["exhausted"] == [first["id"]]

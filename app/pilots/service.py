@@ -82,24 +82,67 @@ class PilotOperationsService:
         observation["interventions"] = self.repository.interventions(session_id)
         return observation
 
-    def claim(self, site_code: str, capabilities: list[str], lease_seconds: int) -> dict[str, Any] | None:
+    def claim(self, site_code: str, capabilities: list[str], lease_seconds: int) -> dict[str, Any]:
+        """节点以真实可用容量为前提领取公共队列中的任务。
+
+        必须同时满足：节点存在且处于 active、节点目录能力与请求能力有交集、运行中与
+        等待安全停止（cancel_requested）的任务合计未达到 max_concurrent。
+        任何条件不满足时不占用队列任务，返回当前占用与拒绝原因。
+        整个判定在 BEGIN IMMEDIATE 事务内完成，配合同步容量检查，并发领取同一空余
+        名额时只有一个节点成功；租约过期但未恢复的任务仍占位，由恢复入口回收。
+        """
+        raw_site_code = site_code.strip()
         now_value = self.clock.now()
         now = to_storage(now_value)
         lease_until = to_storage(now_value + timedelta(seconds=lease_seconds))
         with transaction(immediate=True) as connection:
             repository = PilotRepository(connection)
-            candidate = repository.queued_candidate(capabilities, now)
-            if candidate is None:
-                return None
-            cursor = connection.execute(
-                "UPDATE pilot_sessions SET status='running',attempt_count=attempt_count+1,lease_owner=?,lease_expires_at=?,started_at=COALESCE(started_at,?),updated_at=?,version=version+1 WHERE id=? AND status='queued'",
-                (site_code, lease_until, now, now, candidate["id"]),
-            )
-            if cursor.rowcount != 1:
-                return None
-            return dict(repository.session_by_id(candidate["id"]))
+            site = repository.site_by_code(raw_site_code.lower())
+            if site is None:
+                raise NotFoundError("目的地节点不存在")
+            occupancy = repository.site_occupancy(raw_site_code)
+            capacity = int(site["max_concurrent"])
+            result: dict[str, Any] = {
+                "site_code": site["code"],
+                "site_status": site["status"],
+                "capacity": capacity,
+                "running_sessions": occupancy["running"],
+                "stop_pending_sessions": occupancy["stop_pending"],
+                "occupied_sessions": occupancy["total"],
+                "available_slots": max(0, capacity - occupancy["total"]),
+            }
+            if site["status"] != "active":
+                result.update(session=None, accepted=False, reason="site_not_serviceable",
+                              message="节点当前不在可服务状态（已暂停或关闭）")
+                return result
+            site_capabilities = set(json.loads(site["capabilities_json"]))
+            requested_capabilities = set(capabilities)
+            effective_capabilities = site_capabilities & requested_capabilities if requested_capabilities else site_capabilities
+            if not effective_capabilities:
+                result.update(session=None, accepted=False, reason="capability_mismatch",
+                              message="节点能力与领取请求不匹配，公共队列任务保留给其他节点")
+                return result
+            if occupancy["total"] >= capacity:
+                result.update(session=None, accepted=False, reason="capacity_exhausted",
+                              message=f"节点容量已用尽（{occupancy['total']}/{capacity}），等待安全停止的任务仍占用名额")
+                return result
+            # 多取候选以应对候选刚被其他节点抢走的并发场景；条件更新保证同一任务只会被领取一次。
+            candidates = repository.queued_candidate(effective_capabilities, now, max_candidates=capacity + 1)
+            for candidate in candidates:
+                if repository.try_claim_session(int(candidate["id"]), site["code"], lease_until, now):
+                    claimed = dict(repository.session_by_id(int(candidate["id"])))
+                    result.update(session=claimed, accepted=True, reason="",
+                                  running_sessions=occupancy["running"] + 1,
+                                  occupied_sessions=occupancy["total"] + 1,
+                                  available_slots=max(0, capacity - occupancy["total"] - 1))
+                    return result
+            result.update(available_slots=max(0, capacity - occupancy["total"]),
+                          session=None, accepted=False, reason="no_matching_queued_session",
+                          message="公共队列中没有可领取的匹配任务")
+            return result
 
     def heartbeat(self, session_id: int, site_code: str, lease_seconds: int) -> dict[str, Any]:
+        site_code = site_code.strip().lower()
         now_value = self.clock.now()
         now = to_storage(now_value)
         expires = to_storage(now_value + timedelta(seconds=lease_seconds))
@@ -113,6 +156,7 @@ class PilotOperationsService:
             return dict(PilotRepository(connection).session_by_id(session_id))
 
     def complete(self, session_id: int, site_code: str, observation: dict[str, Any], metrics: dict[str, Any]) -> dict[str, Any]:
+        site_code = site_code.strip().lower()
         now = to_storage(self.clock.now())
         with transaction(immediate=True) as connection:
             repository = PilotRepository(connection)
@@ -133,6 +177,7 @@ class PilotOperationsService:
             return dict(repository.session_by_id(session_id))
 
     def fail(self, session_id: int, site_code: str, error_code: str, message: str, retryable: bool) -> dict[str, Any]:
+        site_code = site_code.strip().lower()
         now_value = self.clock.now()
         now = to_storage(now_value)
         with transaction(immediate=True) as connection:
@@ -187,28 +232,58 @@ class PilotOperationsService:
                 failed.append({"session_id": session_id, "code": exc.code, "message": exc.message})
         return {"batch_key": batch_key, "succeeded": succeeded, "failed": failed}
 
+    def acknowledge_stop(self, session_id: int, site_code: str) -> dict[str, Any]:
+        """节点确认等待安全停止的场次已经停下，立即释放占用名额。"""
+        site_code = site_code.strip().lower()
+        now = to_storage(self.clock.now())
+        with transaction(immediate=True) as connection:
+            repository = PilotRepository(connection)
+            session = repository.session_by_id(session_id)
+            if session is None:
+                raise NotFoundError("运营游览场次不存在")
+            if session["status"] != "cancel_requested":
+                raise ConflictError("只有等待安全停止的游览场次可以确认停止")
+            if session["lease_owner"] != site_code:
+                raise ConflictError("游览场次未由当前执行站点持有")
+            before = dict(session)
+            connection.execute(
+                "UPDATE pilot_sessions SET status='cancelled',lease_owner='',lease_expires_at='',finished_at=?,updated_at=?,version=version+1 WHERE id=?",
+                (now, now, session_id),
+            )
+            after = dict(repository.session_by_id(session_id))
+            repository.add_intervention(session_id=session_id, actor=site_code, action="stop_confirmed", reason="节点确认安全停止并释放容量", before=before, after=after, batch_key="", now=now)
+            return after
+
     def recover_expired(self, actor: str = "recovery-site") -> dict[str, Any]:
         now = to_storage(self.clock.now())
         recovered: list[int] = []
         exhausted: list[int] = []
+        cancelled: list[int] = []
         with transaction(immediate=True) as connection:
             repository = PilotRepository(connection)
-            rows = connection.execute("SELECT * FROM pilot_sessions WHERE status='running' AND lease_expires_at<>'' AND lease_expires_at<? ORDER BY id", (now,)).fetchall()
+            rows = connection.execute("SELECT * FROM pilot_sessions WHERE status IN ('running','cancel_requested') AND lease_expires_at<>'' AND lease_expires_at<? ORDER BY id", (now,)).fetchall()
             for session in rows:
                 before = dict(session)
-                if int(session["attempt_count"]) < int(session["max_attempts"]):
-                    status, finished_at = "queued", None
+                if session["status"] == "cancel_requested":
+                    # 取消请求等待安全停止直到租约超时：超时后按已取消落库并释放容量。
+                    status, finished_at, action, reason = "cancelled", now, "cancel_recovery", "取消请求租约超时，按已取消恢复容量"
+                    error_code, error_message = session["last_error_code"], session["last_error_message"]
+                    cancelled.append(int(session["id"]))
+                elif int(session["attempt_count"]) < int(session["max_attempts"]):
+                    status, finished_at, action, reason = "queued", None, "lease_recovery", "租约过期自动恢复"
+                    error_code, error_message = "lease_expired", "执行站点租约已过期"
                     recovered.append(int(session["id"]))
                 else:
-                    status, finished_at = "failed", now
+                    status, finished_at, action, reason = "failed", now, "lease_recovery", "租约过期且尝试次数用尽"
+                    error_code, error_message = "lease_expired", "执行站点租约已过期"
                     exhausted.append(int(session["id"]))
                 connection.execute(
-                    "UPDATE pilot_sessions SET status=?,lease_owner='',lease_expires_at='',available_at=?,last_error_code='lease_expired',last_error_message='执行站点租约已过期',finished_at=?,updated_at=?,version=version+1 WHERE id=?",
-                    (status, now, finished_at, now, session["id"]),
+                    "UPDATE pilot_sessions SET status=?,lease_owner='',lease_expires_at='',available_at=?,last_error_code=?,last_error_message=?,finished_at=?,updated_at=?,version=version+1 WHERE id=?",
+                    (status, now, error_code, error_message, finished_at, now, session["id"]),
                 )
                 after = dict(repository.session_by_id(session["id"]))
-                repository.add_intervention(session_id=session["id"], actor=actor, action="lease_recovery", reason="租约过期自动恢复", before=before, after=after, batch_key="", now=now)
-        return {"recovered": recovered, "exhausted": exhausted}
+                repository.add_intervention(session_id=session["id"], actor=actor, action=action, reason=reason, before=before, after=after, batch_key="", now=now)
+        return {"recovered": recovered, "exhausted": exhausted, "cancelled": cancelled}
 
     def summary(self) -> dict[str, Any]:
         rows = self.connection.execute("SELECT status,COUNT(*) AS amount FROM pilot_sessions GROUP BY status ORDER BY status").fetchall()
