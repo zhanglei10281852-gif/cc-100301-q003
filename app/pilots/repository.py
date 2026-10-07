@@ -31,6 +31,20 @@ class PilotRepository:
     def quota(self, subject_type: str, subject_key: str) -> sqlite3.Row | None:
         return self.connection.execute("SELECT * FROM pilot_quotas WHERE subject_type=? AND subject_key=?", (subject_type, subject_key)).fetchone()
 
+    def site_by_code(self, code: str) -> sqlite3.Row | None:
+        return self.connection.execute("SELECT * FROM pilot_sites WHERE code=?", (code,)).fetchone()
+
+    def site_occupancy(self, site_code: str) -> dict[str, int]:
+        """返回节点当前占用：运行中与等待安全停止（cancel_requested）都计入。"""
+        rows = self.connection.execute(
+            "SELECT status,COUNT(*) AS amount FROM pilot_sessions WHERE lease_owner=? AND status IN ('running','cancel_requested') GROUP BY status",
+            (site_code,),
+        ).fetchall()
+        amounts = {str(row["status"]): int(row["amount"]) for row in rows}
+        running = amounts.get("running", 0)
+        stopping = amounts.get("cancel_requested", 0)
+        return {"running": running, "stopping": stopping, "occupied": running + stopping}
+
     def upsert_quota(self, *, subject_type: str, subject_key: str, max_queued: int, max_running: int, daily_submissions: int, actor: str, now: str) -> dict[str, Any]:
         self.connection.execute(
             "INSERT INTO pilot_quotas(subject_type,subject_key,max_queued,max_running,daily_submissions,updated_by,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(subject_type,subject_key) DO UPDATE SET max_queued=excluded.max_queued,max_running=excluded.max_running,daily_submissions=excluded.daily_submissions,updated_by=excluded.updated_by,updated_at=excluded.updated_at",
